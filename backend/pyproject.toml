@@ -1,0 +1,18 @@
+[project]
+name = "backend"
+version = "0.1.0"
+dependencies = [
+    "langchain",
+    "langchain-google-genai",
+    "langgraph",
+    "qdrant-client",
+    "google-api-python-client",
+    "google-auth-httplib2",
+    "google-auth-oauthlib",
+    "pydantic",
+    "python-dotenv"
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

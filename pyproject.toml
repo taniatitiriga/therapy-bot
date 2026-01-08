@@ -1,0 +1,9 @@
+[project]
+name = "therapy-bot"
+version = "0.1.0"
+description = "Agentic AI Therapist"
+requires-python = ">=3.11"
+members = ["backend", "frontend"]
+
+[tool.uv]
+# This allows uv to manage the workspace
