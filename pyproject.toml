@@ -1,9 +1,11 @@
 [project]
 name = "therapy-bot"
 version = "0.1.0"
-description = "Agentic AI Therapist"
-requires-python = ">=3.11"
-members = ["backend", "frontend"]
-
-[tool.uv]
-# This allows uv to manage the workspace
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "chainlit>=2.9.4",
+    "langchain>=1.2.2",
+    "langchain-google-genai>=4.1.3",
+]

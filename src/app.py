@@ -1,5 +1,5 @@
 import chainlit as cl
-from backend.src.graph import app_graph
+from graph import app_graph
 from langchain_core.messages import HumanMessage
 
 @cl.on_chat_start
