@@ -1,112 +1,214 @@
+"""LangGraph workflow: triage → empathetic reply / scheduler / crisis."""
+import os
 from typing import Literal
 from langgraph.graph import StateGraph, END
-from langchain_openai import ChatOpenAI
-from backend.src.models import AgentState
-from backend.src.prompts import TRIAGE_SYSTEM_PROMPT, CRISIS_RESPONSE
-from backend.src.services.qdrant import check_recurrence, save_memory
-from backend.src.services.calendar import find_therapists, book_appointment
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from dotenv import load_dotenv
 
-llm = ChatOpenAI(model="gpt-4o")
+from .models import AgentState
+from .prompts import TRIAGE_SYSTEM_PROMPT, CRISIS_RESPONSE
+from .services.qdrant import check_recurrence, save_memory
+from .services.calendar import find_therapists, book_appointment
+from .services import store
+
+load_dotenv()
+llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash-exp", temperature=0.3)
+
+
+def _parse_severity(content: str) -> str:
+    """Extract SEVERITY: normal | concerning | crisis from LLM reply."""
+    if not content:
+        return "normal"
+    content_lower = content.lower()
+    if "severity: crisis" in content_lower or content_lower.strip() == "crisis":
+        return "crisis"
+    if "severity: concerning" in content_lower:
+        return "concerning"
+    return "normal"
+
+
+def _strip_severity_line(content: str) -> str:
+    """Remove the SEVERITY: ... line for display."""
+    if "SEVERITY:" in content:
+        lines = [l for l in content.split("\n") if "SEVERITY:" not in l.upper()]
+        return "\n".join(lines).strip()
+    return content.strip()
+
 
 # --- Nodes ---
 
-def triage_node(state: AgentState):
-    """Analyzes input, checks Qdrant for history, determines flow."""
-    last_message = state["messages"][-1].content
-    
-    # 1. Check Memory (Qdrant)
-    similar_issues = check_recurrence(state["user_id"], last_message)
-    recurrence_count = state.get("recurrence_count", 0) + len(similar_issues)
-    
-    # 2. LLM Analysis (Simplified for brevity)
-    # In reality, you'd use structured output to get a classification
+def triage_node(state: AgentState) -> dict:
+    """Analyze message, check recurrence, classify severity, reply or route."""
+    last_message = state["messages"][-1]
+    if not isinstance(last_message, HumanMessage):
+        return {}
+    content = last_message.content or ""
+
+    # Check memory (recurrence)
+    user_id = state.get("user_id", "")
+    similar = check_recurrence(user_id, content)
+    recurrence_count = state.get("recurrence_count", 0) + (1 if similar else 0)
+    save_memory(user_id, content)
+
+    # LLM triage + empathetic reply
     response = llm.invoke([
-        {"role": "system", "content": TRIAGE_SYSTEM_PROMPT},
-        {"role": "user", "content": last_message}
+        SystemMessage(content=TRIAGE_SYSTEM_PROMPT),
+        HumanMessage(content=content),
     ])
-    
-    # Simple keyword heuristic for this example
-    severity = "normal"
-    if "suicide" in last_message.lower() or "kill" in last_message.lower():
+    if not isinstance(response, AIMessage):
+        response = AIMessage(content=str(response))
+    reply_content = response.content or ""
+
+    severity = _parse_severity(reply_content)
+    # Keyword override for crisis
+    crisis_words = ["suicide", "kill myself", "end my life", "self-harm", "hurt myself"]
+    if any(w in content.lower() for w in crisis_words):
         severity = "crisis"
-    elif recurrence_count > 3:
-        severity = "concerning"
+
+    # If user explicitly asked to schedule, go to scheduler (skip ask_intent)
+    wants_to_schedule = "schedule" in content.lower() or "book" in content.lower() or "appointment" in content.lower()
+
+    # Preserve wait steps so next user message is routed to scheduler
+    current_step = state.get("booking_step", "none")
+    if current_step in ("wait_intent", "wait_slots"):
+        booking_step = current_step
+    elif severity == "crisis":
+        booking_step = "none"
+    elif wants_to_schedule:
+        booking_step = "ask_slots"
+    elif severity == "concerning" and recurrence_count >= 2:
+        booking_step = "ask_intent"
+    else:
+        booking_step = "none"
+
+    display_content = _strip_severity_line(reply_content)
+    if severity == "crisis":
+        display_content = ""  # Will be replaced by crisis node
+    # When waiting for booking input, don't add triage reply; scheduler will respond
+    if current_step in ("wait_intent", "wait_slots"):
+        display_content = ""
 
     return {
-        "messages": [response], 
-        "sentiment_score": 0.5, # Placeholder
+        "messages": [AIMessage(content=display_content)] if display_content else [],
         "recurrence_count": recurrence_count,
-        "booking_step": "none" if severity != "concerning" else "ask_intent"
+        "booking_step": booking_step,
+        "sentiment_score": 0.5,
     }
 
-def crisis_node(state: AgentState):
-    return {"messages": [{"role": "assistant", "content": CRISIS_RESPONSE}]}
 
-def scheduler_node(state: AgentState):
-    """Handles the multi-turn logic of booking."""
-    step = state.get("booking_step")
-    data = state.get("booking_data", {})
-    last_msg = state["messages"][-1].content
+def crisis_node(state: AgentState) -> dict:
+    """Return the fixed crisis hotline message and stop."""
+    return {
+        "messages": [AIMessage(content=CRISIS_RESPONSE)],
+        "booking_step": "none",
+    }
+
+
+def scheduler_node(state: AgentState) -> dict:
+    """Multi-step booking: ask_intent → wait_intent → ask_slots → wait_slots → broadcast → done."""
+    step = state.get("booking_step", "none")
+    data = state.get("booking_data") or {}
+    last_msg = state["messages"][-1]
+    last_content = getattr(last_msg, "content", None) or str(last_msg)
+
+    user_id = state.get("user_id", "")
+    user = store.get_user(user_id)
 
     if step == "ask_intent":
         msg = "I've noticed this has been bothering you for a while. Would you like to speak with a professional therapist? (Yes/No)"
-        return {"booking_step": "wait_intent_answer", "messages": [msg]}
-    
-    elif step == "wait_intent_answer":
-        if "yes" in last_msg.lower():
-            msg = "Okay. Please select a time slot: [Tomorrow 10am, Tomorrow 2pm]. Also, do you prefer a specific gender or proximity?"
-            return {"booking_step": "wait_details", "messages": [msg]}
-        else:
-            msg = "I understand. I'm here to listen."
-            return {"booking_step": "none", "messages": [msg]}
+        return {"booking_step": "wait_intent", "messages": [AIMessage(content=msg)]}
 
-    elif step == "wait_details":
-        # Simulate logic to parse input and call GCal
-        # In production: Use an extraction chain here
-        success = book_appointment(data)
-        msg = "Appointment confirmed! I've sent the invite to your Google Calendar."
-        return {"booking_step": "done", "messages": [msg]}
+    if step == "wait_intent":
+        if "yes" in last_content.lower():
+            msg = (
+                "Okay. Please tell me when you're available (e.g. 'next Friday after 11 am', 'any time next Tuesday'). "
+                "Optionally, you can specify a preferred therapist gender or city (e.g. 'female therapist in Brooklyn')."
+            )
+            return {"booking_step": "wait_slots", "messages": [AIMessage(content=msg)]}
+        msg = "I understand. I'm here whenever you want to talk."
+        return {"booking_step": "none", "messages": [AIMessage(content=msg)]}
+
+    if step == "ask_slots":
+        msg = (
+            "When would you like to have a session? (e.g. 'next Friday after 11 am', 'any time next Tuesday'). "
+            "You can also say your preferred therapist gender or city (e.g. 'female therapist in Brooklyn')."
+        )
+        return {"booking_step": "wait_slots", "messages": [AIMessage(content=msg)]}
+
+    if step == "wait_slots":
+        if not user:
+            return {"booking_step": "none", "messages": [AIMessage(content="Please log in to book an appointment.")]}
+        # Parse timeslot and optional gender/city from last_content (simplified: use whole message as timeslot)
+        timeslot = last_content.strip()
+        gender_pref = None
+        city_pref = None
+        # Naive parsing: "female therapist in Brooklyn" -> gender=female, city=Brooklyn
+        words = timeslot.lower().split()
+        if "female" in words or "woman" in words:
+            gender_pref = "female"
+        elif "male" in words or "man" in words:
+            gender_pref = "male"
+        if "in " in timeslot.lower():
+            parts = timeslot.lower().split(" in ", 1)
+            if len(parts) == 2:
+                city_pref = parts[1].strip().split()[0].capitalize()
+                timeslot = parts[0].strip()
+        if not timeslot:
+            timeslot = last_content.strip()
+        data = {"timeslot": timeslot, "gender_pref": gender_pref, "city_pref": city_pref}
+        request_id = book_appointment(data, user)
+        msg = (
+            "I've sent your availability to matching therapists in your area. "
+            "The first therapist who accepts will confirm the appointment, and you'll both get a calendar invite. "
+            "You'll see the appointment in your calendar tab when it's confirmed."
+        )
+        return {
+            "booking_step": "done",
+            "booking_data": data,
+            "messages": [AIMessage(content=msg)],
+        }
 
     return {"booking_step": "none"}
 
-# --- Conditional Logic ---
 
-def route_triage(state: AgentState) -> Literal["crisis", "scheduler", "end"]:
-    last_content = state["messages"][-1].content
-    if state.get("booking_step") == "ask_intent":
-        return "scheduler"
-    if "crisis" in last_content.lower(): # Or based on classification
+# --- Routing ---
+
+def route_after_triage(state: AgentState) -> Literal["crisis", "scheduler", "end"]:
+    """Route to crisis, scheduler, or end (empathetic reply already in state)."""
+    last_content = ""
+    for m in reversed(state.get("messages", [])):
+        if hasattr(m, "content") and m.content:
+            last_content = (m.content or "").lower()
+            break
+    severity = _parse_severity(last_content)
+    crisis_words = ["suicide", "kill myself", "end my life"]
+    if severity == "crisis" or any(w in last_content for w in crisis_words):
         return "crisis"
-    return "end" # Just a normal chat reply
+    step = state.get("booking_step", "none")
+    if step in ("ask_intent", "wait_intent", "ask_slots", "wait_slots"):
+        return "scheduler"
+    return "end"
 
-def route_scheduler(state: AgentState):
-    if state["booking_step"] in ["done", "none"]:
-        return "end"
-    return "wait_input" # Wait for user reply in chainlit
 
-# --- Graph Construction ---
+def route_after_scheduler(state: AgentState) -> Literal["scheduler", "end"]:
+    step = state.get("booking_step", "none")
+    if step in ("wait_intent", "wait_slots"):
+        return "end"  # Wait for user input in Chainlit
+    if step in ("ask_intent", "ask_slots"):
+        return "scheduler"
+    return "end"
+
+
+# --- Graph ---
 
 workflow = StateGraph(AgentState)
-
 workflow.add_node("triage", triage_node)
 workflow.add_node("crisis", crisis_node)
 workflow.add_node("scheduler", scheduler_node)
-
 workflow.set_entry_point("triage")
-
-workflow.add_conditional_edges(
-    "triage",
-    route_triage,
-    {
-        "crisis": "crisis",
-        "scheduler": "scheduler",
-        "end": END
-    }
-)
-
-# If we are in the scheduler loop, we might return to END to wait for user input
-# or loop back to scheduler to process the next step
-workflow.add_edge("scheduler", END)
+workflow.add_conditional_edges("triage", route_after_triage, {"crisis": "crisis", "scheduler": "scheduler", "end": END})
 workflow.add_edge("crisis", END)
+workflow.add_conditional_edges("scheduler", route_after_scheduler, {"scheduler": "scheduler", "end": END})
 
 app_graph = workflow.compile()
