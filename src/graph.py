@@ -9,13 +9,13 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from dotenv import load_dotenv
 
 from .models import AgentState
-from .prompts import TRIAGE_SYSTEM_PROMPT, CRISIS_RESPONSE
+from .prompts import TRIAGE_SYSTEM_PROMPT, CRISIS_RESPONSE, SAFETY_PROMPT
 from .services.qdrant import check_recurrence, save_memory
 from .services.calendar import find_therapists, book_appointment
 from .services import store
 
 load_dotenv()
-llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0.3)
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.3)
 
 
 def _get_content_str(content: any) -> str:
@@ -34,6 +34,18 @@ def _get_content_str(content: any) -> str:
                 parts.append(str(c))
         return " ".join(parts)
     return str(content) if content is not None else ""
+
+
+def _check_safety(content: str) -> bool:
+    """Return True if message is safe, False if it's a prompt injection attempt."""
+    try:
+        # Fast, low-temp check
+        response = llm.invoke([HumanMessage(content=SAFETY_PROMPT.format(content=content))])
+        result = _get_content_str(response.content).strip().upper()
+        return "UNSAFE" not in result
+    except Exception as e:
+        print(f"Safety check error: {e}")
+        return True  # Fail open to avoid blocking valid users on error
 
 
 def _parse_datetime_with_llm(text: str, history: list = None) -> dict:
@@ -110,6 +122,15 @@ def triage_node(state: AgentState) -> dict:
     recurrence_count = state.get("recurrence_count", 0) + (1 if similar else 0)
     save_memory(user_id, content)
 
+    # Safety check for prompt injection
+    if not _check_safety(content):
+        msg = "I'm sorry, but I can only function as a therapy assistant. I'm here to listen if you'd like to talk about what's on your mind."
+        return {
+            "messages": [AIMessage(content=msg)],
+            "booking_step": "none",
+            "severity": "normal"
+        }
+
     # LLM triage + empathetic reply
     messages = [SystemMessage(content=TRIAGE_SYSTEM_PROMPT)] + state["messages"]
     response = llm.invoke(messages)
@@ -150,6 +171,7 @@ def triage_node(state: AgentState) -> dict:
         "recurrence_count": recurrence_count,
         "booking_step": booking_step,
         "sentiment_score": 0.5,
+        "severity": severity,
     }
     if display_content:
         result["messages"] = [AIMessage(content=display_content)]
@@ -162,6 +184,7 @@ def crisis_node(state: AgentState) -> dict:
     return {
         "messages": [AIMessage(content=CRISIS_RESPONSE)],
         "booking_step": "none",
+        "severity": "crisis",
     }
 
 
@@ -250,14 +273,22 @@ def scheduler_node(state: AgentState) -> dict:
 
 def route_after_triage(state: AgentState) -> Literal["crisis", "scheduler", "end"]:
     """Route to crisis, scheduler, or end (empathetic reply already in state)."""
-    last_content = ""
-    for m in reversed(state.get("messages", [])):
-        if hasattr(m, "content") and m.content:
-            last_content = _get_content_str(m.content).lower()
-            break
-    severity = _parse_severity(last_content)
-    crisis_words = ["suicide", "kill myself", "end my life"]
-    if severity == "crisis" or any(w in last_content for w in crisis_words):
+    # Use pre-calculated severity if available
+    severity = state.get("severity")
+    
+    # Fallback to re-parsing if not in state (e.g. tests or legacy)
+    if not severity:
+        last_content = ""
+        for m in reversed(state.get("messages", [])):
+            if hasattr(m, "content") and m.content:
+                last_content = _get_content_str(m.content).lower()
+                break
+        severity = _parse_severity(last_content)
+        crisis_words = ["suicide", "kill myself", "end my life"]
+        if any(w in last_content for w in crisis_words):
+            severity = "crisis"
+
+    if severity == "crisis":
         return "crisis"
     step = state.get("booking_step", "none")
     if step in ("ask_intent", "wait_intent", "ask_slots", "wait_slots"):

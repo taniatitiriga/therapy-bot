@@ -39,5 +39,6 @@ class AgentState(TypedDict, total=False):
     user_id: str
     sentiment_score: float
     recurrence_count: int
+    severity: str  # "normal", "concerning", "crisis"
     booking_step: str  # "none", "ask_intent", "wait_intent", "ask_slots", "wait_slots", "matching", "done"
     booking_data: dict  # timeslots, gender_pref, city_pref, etc.

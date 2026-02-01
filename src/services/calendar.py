@@ -65,18 +65,22 @@ def accept_appointment(therapist_id: str, request_id: str) -> Optional[dict]:
     
     store.confirm_appointment(request_id, therapist_id, appointment)
     
-    # Create real calendar event
-    link = _create_real_calendar_event(appointment, therapist_id)
-    if link:
-        appointment["calendar_link"] = link
-        # Update the confirmed appointment with the link
+    # Create real calendar events (separate for client and therapist to have custom titles)
+    # We create two events. The link returned to the UI (for the client) will be the client's event link.
+    link_client = _create_real_calendar_event(appointment, therapist_id, target="client")
+    link_therapist = _create_real_calendar_event(appointment, therapist_id, target="therapist")
+    
+    if link_client:
+        appointment["calendar_link"] = link_client
+        # We could store therapist link too if needed, e.g. appointment["therapist_link"] = link_therapist
+        # For MVP, storing the client link in the main field ensures the user sees it.
         store.confirm_appointment(request_id, therapist_id, appointment)
         
     return store.get_appointment(request_id)
 
 
-def _create_real_calendar_event(appointment: dict, therapist_id: str) -> str:
-    """Create Google Calendar event if credentials exist."""
+def _create_real_calendar_event(appointment: dict, therapist_id: str, target: str = "client") -> str:
+    """Create Google Calendar event for a specific target (client or therapist)."""
     start_iso = appointment.get("start_iso")
     end_iso = appointment.get("end_iso")
     
@@ -88,13 +92,21 @@ def _create_real_calendar_event(appointment: dict, therapist_id: str) -> str:
     client_id = appointment.get("client_user_id")
     client = store.get_user(client_id)
     
+    client_name = client.full_name if client else 'Client'
+    therapist_name = therapist.full_name if therapist else 'Therapist'
+    
     emails = []
-    if therapist and therapist.email:
-        emails.append(therapist.email)
-    if client and client.email:
-        emails.append(client.email)
-        
-    summary = f"Therapy Session: {client.full_name if client else 'Client'} <> {therapist.full_name if therapist else 'Therapist'}"
+    summary = ""
+    
+    if target == "client":
+        summary = f"Therapy Session with {therapist_name}"
+        if client and client.email:
+            emails.append(client.email)
+    else: # target == "therapist"
+        summary = f"Therapy Session with {client_name}"
+        if therapist and therapist.email:
+            emails.append(therapist.email)
+
     description = f"Therapy session booked via Therapy Bot.\nRequest ID: {appointment['request_id']}"
     
     return gcal.create_event(
