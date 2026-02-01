@@ -130,8 +130,12 @@ async def main(message: cl.Message):
         return
 
     # Build graph inputs (preserve booking_step from session)
+    history = cl.user_session.get("history", [])
+    new_message = HumanMessage(content=content)
+    history.append(new_message)
+    
     inputs = {
-        "messages": [HumanMessage(content=content)],
+        "messages": history,
         "user_id": user_id,
         "recurrence_count": 0,
         "booking_step": cl.user_session.get("booking_state", "none"),
@@ -143,13 +147,15 @@ async def main(message: cl.Message):
         async for output in app_graph.astream(inputs):
             for key, value in output.items():
                 if "messages" in value and value["messages"]:
-                    last_msg = value["messages"][-1]
-                    if hasattr(last_msg, "content") and last_msg.content:
-                        await cl.Message(content=last_msg.content).send()
+                    for m in value["messages"]:
+                        if hasattr(m, "content") and m.content:
+                            await cl.Message(content=m.content).send()
+                            history.append(m)
                 if "booking_step" in value:
                     cl.user_session.set("booking_state", value["booking_step"])
                 if "booking_data" in value:
                     cl.user_session.set("booking_data", value["booking_data"])
+        cl.user_session.set("history", history)
     except Exception as e:
         await cl.Message(content=f"Sorry, I encountered an error: {str(e)}").send()
 

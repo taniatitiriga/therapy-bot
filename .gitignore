@@ -209,3 +209,10 @@ __marimo__/
 # Chainlit
 .chainlit/*
 !.chainlit/config.toml
+
+# Gemini
+GEMINI.md
+
+# Google credentials
+token.json
+credentials.json

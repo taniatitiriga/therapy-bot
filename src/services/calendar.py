@@ -1,8 +1,9 @@
-"""Therapist matching and appointment booking. MVP: in-memory match + stub Google Calendar."""
+"""Therapist matching and appointment booking. MVP: in-memory match + Google Calendar integration."""
 import uuid
 from typing import List, Optional, Any
 from ..models import User
 from . import store
+from . import gcal
 
 
 def find_therapists(
@@ -20,6 +21,8 @@ def broadcast_request(
     timeslot_text: str,
     gender_pref: Optional[str] = None,
     city_pref: Optional[str] = None,
+    start_iso: Optional[str] = None,
+    end_iso: Optional[str] = None,
 ) -> str:
     """Broadcast appointment request to matching therapists. Returns request_id."""
     therapists = find_therapists(
@@ -33,6 +36,8 @@ def broadcast_request(
         "client_user_id": client_user.user_id,
         "client_details": client_user.to_dict(),
         "timeslot": timeslot_text,
+        "start_iso": start_iso,
+        "end_iso": end_iso,
     }
     for t in therapists:
         store.add_pending_request(t.user_id, request)
@@ -45,21 +50,60 @@ def accept_appointment(therapist_id: str, request_id: str) -> Optional[dict]:
     req = next((r for r in reqs if r.get("request_id") == request_id), None)
     if not req:
         return None
+    
     store.clear_pending_request_globally(request_id)
+    
+    # Enrich appointment with request details
     appointment = {
         "request_id": request_id,
         "client_user_id": req["client_user_id"],
         "timeslot": req["timeslot"],
         "client_details": req.get("client_details", {}),
+        "start_iso": req.get("start_iso"),
+        "end_iso": req.get("end_iso"),
     }
+    
     store.confirm_appointment(request_id, therapist_id, appointment)
-    _add_to_calendar_stub(appointment, therapist_id)
+    
+    # Create real calendar event
+    link = _create_real_calendar_event(appointment, therapist_id)
+    if link:
+        appointment["calendar_link"] = link
+        # Update the confirmed appointment with the link
+        store.confirm_appointment(request_id, therapist_id, appointment)
+        
     return store.get_appointment(request_id)
 
 
-def _add_to_calendar_stub(appointment: dict, therapist_id: str) -> None:
-    """Stub: in production would create Google Calendar events for client and therapist."""
-    pass
+def _create_real_calendar_event(appointment: dict, therapist_id: str) -> str:
+    """Create Google Calendar event if credentials exist."""
+    start_iso = appointment.get("start_iso")
+    end_iso = appointment.get("end_iso")
+    
+    if not start_iso or not end_iso:
+        print("Skipping calendar event: missing ISO dates.")
+        return ""
+        
+    therapist = store.get_user(therapist_id)
+    client_id = appointment.get("client_user_id")
+    client = store.get_user(client_id)
+    
+    emails = []
+    if therapist and therapist.email:
+        emails.append(therapist.email)
+    if client and client.email:
+        emails.append(client.email)
+        
+    summary = f"Therapy Session: {client.full_name if client else 'Client'} <> {therapist.full_name if therapist else 'Therapist'}"
+    description = f"Therapy session booked via Therapy Bot.\nRequest ID: {appointment['request_id']}"
+    
+    return gcal.create_event(
+        summary=summary,
+        start_iso=start_iso,
+        end_iso=end_iso,
+        attendees_emails=emails,
+        description=description
+    )
 
 
 def book_appointment(booking_data: dict, client_user: User) -> str:
@@ -67,4 +111,14 @@ def book_appointment(booking_data: dict, client_user: User) -> str:
     timeslot = booking_data.get("timeslot", "").strip()
     gender_pref = booking_data.get("gender_pref") or None
     city_pref = booking_data.get("city_pref") or None
-    return broadcast_request(client_user, timeslot, gender_pref=gender_pref, city_pref=city_pref)
+    start_iso = booking_data.get("start_iso")
+    end_iso = booking_data.get("end_iso")
+    
+    return broadcast_request(
+        client_user, 
+        timeslot, 
+        gender_pref=gender_pref, 
+        city_pref=city_pref,
+        start_iso=start_iso,
+        end_iso=end_iso
+    )

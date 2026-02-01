@@ -1,5 +1,7 @@
 """LangGraph workflow: triage → empathetic reply / scheduler / crisis."""
 import os
+import json
+import datetime
 from typing import Literal
 from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -13,11 +15,68 @@ from .services.calendar import find_therapists, book_appointment
 from .services import store
 
 load_dotenv()
-llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash-exp", temperature=0.3)
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0.3)
+
+
+def _get_content_str(content: any) -> str:
+    """Safely extract string content from a message (handling strings and lists)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        # Handle list of strings or dicts (e.g. from multimodal models)
+        parts = []
+        for c in content:
+            if isinstance(c, str):
+                parts.append(c)
+            elif isinstance(c, dict) and "text" in c:
+                parts.append(c["text"])
+            else:
+                parts.append(str(c))
+        return " ".join(parts)
+    return str(content) if content is not None else ""
+
+
+def _parse_datetime_with_llm(text: str, history: list = None) -> dict:
+    """Use LLM to convert natural language time to ISO format relative to now."""
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    context = ""
+    if history:
+        # Get last 5 messages for context
+        context_msgs = history[-5:]
+        context = "Context from previous messages:\n"
+        for m in context_msgs:
+            role = "User" if isinstance(m, HumanMessage) else "Assistant"
+            msg_text = _get_content_str(m.content)
+            context += f"{role}: {msg_text}\n"
+
+    prompt = f"""
+    Current date and time: {now_str}
+    {context}
+    User input: "{text}"
+    
+    Extract the desired appointment start and end times in ISO 8601 format (YYYY-MM-DDTHH:MM:SS).
+    Assume a default duration of 1 hour if not specified.
+    Return ONLY a JSON object with keys "start_iso" and "end_iso".
+    Example: {{"start_iso": "2024-01-01T10:00:00", "end_iso": "2024-01-01T11:00:00"}}
+    If no time is specified, return empty strings.
+    """
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        content = _get_content_str(response.content)
+        # cleanup markdown code blocks if present
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0].strip()
+        return json.loads(content)
+    except Exception as e:
+        print(f"Error parsing date: {e}")
+        return {"start_iso": "", "end_iso": ""}
 
 
 def _parse_severity(content: str) -> str:
     """Extract SEVERITY: normal | concerning | crisis from LLM reply."""
+    content = _get_content_str(content)
     if not content:
         return "normal"
     content_lower = content.lower()
@@ -43,7 +102,7 @@ def triage_node(state: AgentState) -> dict:
     last_message = state["messages"][-1]
     if not isinstance(last_message, HumanMessage):
         return {}
-    content = last_message.content or ""
+    content = _get_content_str(last_message.content)
 
     # Check memory (recurrence)
     user_id = state.get("user_id", "")
@@ -52,13 +111,11 @@ def triage_node(state: AgentState) -> dict:
     save_memory(user_id, content)
 
     # LLM triage + empathetic reply
-    response = llm.invoke([
-        SystemMessage(content=TRIAGE_SYSTEM_PROMPT),
-        HumanMessage(content=content),
-    ])
+    messages = [SystemMessage(content=TRIAGE_SYSTEM_PROMPT)] + state["messages"]
+    response = llm.invoke(messages)
     if not isinstance(response, AIMessage):
         response = AIMessage(content=str(response))
-    reply_content = response.content or ""
+    reply_content = _get_content_str(response.content)
 
     severity = _parse_severity(reply_content)
     # Keyword override for crisis
@@ -86,15 +143,18 @@ def triage_node(state: AgentState) -> dict:
     if severity == "crisis":
         display_content = ""  # Will be replaced by crisis node
     # When waiting for booking input, don't add triage reply; scheduler will respond
-    if current_step in ("wait_intent", "wait_slots"):
+    if current_step in ("wait_intent", "wait_slots") or booking_step in ("ask_intent", "ask_slots"):
         display_content = ""
 
-    return {
-        "messages": [AIMessage(content=display_content)] if display_content else [],
+    result = {
         "recurrence_count": recurrence_count,
         "booking_step": booking_step,
         "sentiment_score": 0.5,
     }
+    if display_content:
+        result["messages"] = [AIMessage(content=display_content)]
+    
+    return result
 
 
 def crisis_node(state: AgentState) -> dict:
@@ -110,7 +170,7 @@ def scheduler_node(state: AgentState) -> dict:
     step = state.get("booking_step", "none")
     data = state.get("booking_data") or {}
     last_msg = state["messages"][-1]
-    last_content = getattr(last_msg, "content", None) or str(last_msg)
+    last_content = _get_content_str(getattr(last_msg, "content", None) or str(last_msg))
 
     user_id = state.get("user_id", "")
     user = store.get_user(user_id)
@@ -152,12 +212,26 @@ def scheduler_node(state: AgentState) -> dict:
         if "in " in timeslot.lower():
             parts = timeslot.lower().split(" in ", 1)
             if len(parts) == 2:
-                city_pref = parts[1].strip().split()[0].capitalize()
-                timeslot = parts[0].strip()
+                city_part = parts[1].strip()
+                if city_part:
+                    city_pref = city_part.split()[0].capitalize()
+                    timeslot = parts[0].strip()
+        
         if not timeslot:
             timeslot = last_content.strip()
-        data = {"timeslot": timeslot, "gender_pref": gender_pref, "city_pref": city_pref}
+        
+        # Use LLM to get strict ISO times
+        parsed_times = _parse_datetime_with_llm(timeslot, state["messages"])
+        
+        data = {
+            "timeslot": timeslot,
+            "gender_pref": gender_pref,
+            "city_pref": city_pref,
+            "start_iso": parsed_times.get("start_iso"),
+            "end_iso": parsed_times.get("end_iso"),
+        }
         request_id = book_appointment(data, user)
+        
         msg = (
             "I've sent your availability to matching therapists in your area. "
             "The first therapist who accepts will confirm the appointment, and you'll both get a calendar invite. "
@@ -179,7 +253,7 @@ def route_after_triage(state: AgentState) -> Literal["crisis", "scheduler", "end
     last_content = ""
     for m in reversed(state.get("messages", [])):
         if hasattr(m, "content") and m.content:
-            last_content = (m.content or "").lower()
+            last_content = _get_content_str(m.content).lower()
             break
     severity = _parse_severity(last_content)
     crisis_words = ["suicide", "kill myself", "end my life"]

@@ -75,7 +75,7 @@ def seed_demo_users() -> None:
     """Seed a few demo users so the app works out of the box."""
     if _users:
         return
-    add_user(User("user_1", "alice", "Alice User", "New York", "alice@example.com", "female", False))
+    add_user(User("user_1", "alice", "Alice User", "New York", "rin671628@gmail.com", "female", False))
     add_user(User("user_2", "bob", "Bob User", "Brooklyn", "bob@example.com", "male", False))
-    add_user(User("therapist_1", "dr_smith", "Dr. Jane Smith", "New York", "jane@therapy.com", "female", True))
+    add_user(User("therapist_1", "dr_smith", "Dr. Jane Smith", "New York", "arthur.atogard.business@gmail.com", "female", True))
     add_user(User("therapist_2", "dr_jones", "Dr. John Jones", "Brooklyn", "john@therapy.com", "male", True))
