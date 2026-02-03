@@ -13,6 +13,8 @@ def find_therapists(
 ) -> List[User]:
     """Filter nearby therapists by gender and city (or user's city)."""
     location = (city_pref or user_location).strip() or user_location
+    if location.lower() == "unknown":
+        location = ""
     return store.list_therapists(location=location, gender=gender_pref)
 
 

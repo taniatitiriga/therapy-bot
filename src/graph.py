@@ -9,7 +9,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from dotenv import load_dotenv
 
 from .models import AgentState
-from .prompts import TRIAGE_SYSTEM_PROMPT, CRISIS_RESPONSE, SAFETY_PROMPT
+from .prompts import TRIAGE_SYSTEM_PROMPT, CRISIS_RESPONSE
 from .services.qdrant import check_recurrence, save_memory
 from .services.calendar import find_therapists, book_appointment
 from .services import store
@@ -34,18 +34,6 @@ def _get_content_str(content: any) -> str:
                 parts.append(str(c))
         return " ".join(parts)
     return str(content) if content is not None else ""
-
-
-def _check_safety(content: str) -> bool:
-    """Return True if message is safe, False if it's a prompt injection attempt."""
-    try:
-        # Fast, low-temp check
-        response = llm.invoke([HumanMessage(content=SAFETY_PROMPT.format(content=content))])
-        result = _get_content_str(response.content).strip().upper()
-        return "UNSAFE" not in result
-    except Exception as e:
-        print(f"Safety check error: {e}")
-        return True  # Fail open to avoid blocking valid users on error
 
 
 def _parse_datetime_with_llm(text: str, history: list = None) -> dict:
@@ -122,8 +110,15 @@ def triage_node(state: AgentState) -> dict:
     recurrence_count = state.get("recurrence_count", 0) + (1 if similar else 0)
     save_memory(user_id, content)
 
-    # Safety check for prompt injection
-    if not _check_safety(content):
+    # LLM triage + empathetic reply (Integrated Safety Check)
+    messages = [SystemMessage(content=TRIAGE_SYSTEM_PROMPT)] + state["messages"]
+    response = llm.invoke(messages)
+    if not isinstance(response, AIMessage):
+        response = AIMessage(content=str(response))
+    reply_content = _get_content_str(response.content)
+
+    # Check for safety refusal from LLM
+    if "UNSAFE_INJECTION" in reply_content:
         msg = "I'm sorry, but I can only function as a therapy assistant. I'm here to listen if you'd like to talk about what's on your mind."
         return {
             "messages": [AIMessage(content=msg)],
@@ -131,17 +126,10 @@ def triage_node(state: AgentState) -> dict:
             "severity": "normal"
         }
 
-    # LLM triage + empathetic reply
-    messages = [SystemMessage(content=TRIAGE_SYSTEM_PROMPT)] + state["messages"]
-    response = llm.invoke(messages)
-    if not isinstance(response, AIMessage):
-        response = AIMessage(content=str(response))
-    reply_content = _get_content_str(response.content)
-
     severity = _parse_severity(reply_content)
     # Keyword override for crisis
     crisis_words = ["suicide", "kill myself", "end my life", "self-harm", "hurt myself"]
-    if any(w in content.lower() for w in crisis_words):
+    if "CRISIS" in reply_content or any(w in content.lower() for w in crisis_words):
         severity = "crisis"
 
     # If user explicitly asked to schedule, go to scheduler (skip ask_intent)
@@ -155,12 +143,14 @@ def triage_node(state: AgentState) -> dict:
         booking_step = "none"
     elif wants_to_schedule:
         booking_step = "ask_slots"
-    elif severity == "concerning" and recurrence_count >= 2:
+    # elif severity == "concerning" and recurrence_count >= 2:
+    elif severity == "concerning":
         booking_step = "ask_intent"
     else:
         booking_step = "none"
 
-    display_content = _strip_severity_line(reply_content)
+    # display_content = _strip_severity_line(reply_content)
+    display_content = reply_content
     if severity == "crisis":
         display_content = ""  # Will be replaced by crisis node
     # When waiting for booking input, don't add triage reply; scheduler will respond

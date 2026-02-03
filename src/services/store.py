@@ -8,9 +8,23 @@ _pending_requests: Dict[str, List[dict]] = {}
 # request_id -> { "client_user_id", "therapist_user_id", "timeslot", "accepted_by" }
 _confirmed_appointments: Dict[str, dict] = {}
 
+# Global passwords dictionary (In-memory MVP)
+USER_PASSWORDS = {
+    "alice": "alice123",
+    "bob": "bob123",
+    "dr_smith": "doctor123",
+    "dr_jones": "doctor123",
+}
+
 
 def add_user(user: User) -> None:
     _users[user.user_id] = user
+
+
+def register_user(user: User, password: str) -> None:
+    """Add user and set password."""
+    add_user(user)
+    USER_PASSWORDS[user.username] = password
 
 
 def get_user(user_id: str) -> Optional[User]:

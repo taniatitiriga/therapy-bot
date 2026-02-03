@@ -12,36 +12,116 @@ from langchain_core.messages import HumanMessage
 from src.graph import app_graph
 from src.services import store
 from src.services.calendar import accept_appointment
+from src.models import User
+
+
+import uuid
+from typing import Optional, Dict
+import chainlit as cl
+from langchain_core.messages import HumanMessage
+
+from src.graph import app_graph
+from src.services import store
+from src.services.calendar import accept_appointment
+from src.models import User
+
+
+@cl.oauth_callback
+def oauth_callback(
+  provider_id: str,
+  token: str,
+  raw_user_data: Dict[str, str],
+  default_user: cl.User,
+) -> Optional[cl.User]:
+    """Handle Google OAuth login."""
+    try:
+        if provider_id == "google":
+            email = default_user.metadata.get("email") or raw_user_data.get("email")
+            full_name = default_user.metadata.get("name") or raw_user_data.get("name") or "User"
+            
+            if not email:
+                return None
+
+            # Check if user exists by email (naive check by iterating store)
+            # We need a helper for get_user_by_email, or just iterate here for MVP
+            existing_user = None
+            for u in store._users.values():
+                if u.email == email:
+                    existing_user = u
+                    break
+            
+            if existing_user:
+                return cl.User(
+                    identifier=existing_user.user_id,
+                    display_name=existing_user.full_name,
+                    metadata={
+                        "username": existing_user.username,
+                        "full_name": existing_user.full_name,
+                        "location": existing_user.location,
+                        "email": existing_user.email,
+                        "gender": existing_user.gender,
+                        "is_therapist": existing_user.is_therapist,
+                    }
+                )
+            else:
+                # Auto-register new OAuth user
+                new_user_id = str(uuid.uuid4())
+                # Generate a username from email
+                username = email.split("@")[0]
+                
+                new_user = User(
+                    user_id=new_user_id,
+                    username=username,
+                    full_name=full_name,
+                    location="Unknown", # Prompt for this later?
+                    email=email,
+                    is_therapist=False # Default to Client
+                )
+                store.add_user(new_user)
+                
+                return cl.User(
+                    identifier=new_user_id,
+                    display_name=full_name,
+                    metadata={
+                        "username": username,
+                        "full_name": full_name,
+                        "location": "Unknown",
+                        "email": email,
+                        "gender": "",
+                        "is_therapist": False,
+                    }
+                )
+    except Exception as e:
+        print(f"OAuth Error: {e}")
+        return None
+    return None
 
 
 @cl.password_auth_callback
 def auth_callback(username: str, password: str):
     """Authenticate users with username/password."""
-    store.seed_demo_users()
-    
-    # Demo passwords (in production, use proper hashing!)
-    demo_passwords = {
-        "alice": "alice123",
-        "bob": "bob123",
-        "dr_smith": "doctor123",
-        "dr_jones": "doctor123",
-    }
-    
-    # Check if username exists and password matches
-    if username in demo_passwords and password == demo_passwords[username]:
-        user = store.get_user_by_username(username)
-        if user:
-            return cl.User(
-                identifier=user.user_id,
-                metadata={
-                    "username": user.username,
-                    "full_name": user.full_name,
-                    "location": user.location,
-                    "email": user.email,
-                    "gender": user.gender,
-                    "is_therapist": user.is_therapist,
-                }
-            )
+    try:
+        store.seed_demo_users()
+        
+        # Check against global passwords in store
+        if username in store.USER_PASSWORDS and password == store.USER_PASSWORDS[username]:
+            user = store.get_user_by_username(username)
+            if user:
+                return cl.User(
+                    identifier=user.user_id,
+                    display_name=user.full_name,
+                    metadata={
+                        "username": user.username,
+                        "full_name": user.full_name,
+                        "location": user.location,
+                        "email": user.email,
+                        "gender": user.gender,
+                        "is_therapist": user.is_therapist,
+                    }
+                )
+    except Exception as e:
+        print(f"Auth Error: {e}")
+        return None
     return None
 
 
@@ -55,10 +135,27 @@ async def start():
     if not chainlit_user:
         await cl.Message(content="Please log in to continue.").send()
         return
-    
+
     # Get user from store
     user_id = chainlit_user.identifier
     user = store.get_user(user_id)
+    
+    # Logic to restore user if store was wiped (since it's in-memory) but session persists
+    if not user and chainlit_user.metadata:
+        user = User(
+            user_id=user_id,
+            username=chainlit_user.metadata.get("username", ""),
+            full_name=chainlit_user.metadata.get("full_name", "User"),
+            location=chainlit_user.metadata.get("location", "Unknown"),
+            email=chainlit_user.metadata.get("email", ""),
+            gender=chainlit_user.metadata.get("gender", ""),
+            is_therapist=chainlit_user.metadata.get("is_therapist", False),
+        )
+        store.add_user(user)
+
+    if not user:
+        await cl.Message(content="Session expired. Please log out and log in again.").send()
+        return
     
     # Set session variables
     cl.user_session.set("history", [])
